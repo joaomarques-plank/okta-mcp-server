@@ -28,13 +28,20 @@ class OktaAppContext:
 @asynccontextmanager
 async def okta_authorisation_flow(server: FastMCP) -> AsyncIterator[OktaAppContext]:
     """
-    Manages the application lifecycle. It initializes the OktaManager on startup,
-    performs authorization, and yields the context for use in tools.
+    Manages the application lifecycle. It initializes the OktaManager on startup
+    and yields the context for use in tools.
+
+    Authentication is deliberately NOT performed here. The Okta auth call is a
+    blocking network round-trip; doing it in the lifespan blocks the MCP
+    ``initialize`` response. Hosted runtimes that reap idle sessions (e.g.
+    ``--sessionTimeoutMs``) then kill the session before initialize finishes,
+    the client retries, and each retry spawns a fresh process that competes for
+    CPU — turning a ~10s auth into 100s+ and a timeout pileup. Instead we let the
+    first tool call authenticate lazily via ``get_okta_client`` so initialize
+    stays fast. Scope pruning is safe here: it reads OKTA_SCOPES, not the token.
     """
-    logger.info("Starting Okta authorization flow")
+    logger.info("Starting Okta authorization flow (auth deferred to first tool call)")
     manager = OktaAuthManager()
-    await manager.authenticate()
-    logger.info("Okta authentication completed successfully")
     prune_tools_by_scope(server, manager)
 
     try:

@@ -8,6 +8,7 @@
 # This module handles the authentication flow for Okta using the Device Authorization Grant.
 # It initiates the device authorization, polls for the access token, and manages the Okta API token lifecycle.
 
+import asyncio
 import os
 import sys
 import time
@@ -34,12 +35,15 @@ class OktaAuthManager:
     private_key: str = field(init=False, default=None)
     key_id: str = field(init=False, default=None)
     use_browserless_auth: bool = field(init=False, default=False)
+    # Serializes lazy re-auth so concurrent first tool calls don't all hit Okta.
+    _auth_lock: asyncio.Lock = field(init=False, repr=False, compare=False)
 
     # TODO: Implement a way to set scopes dynamically by the user if needed.
 
     def __init__(self):
         """Initialize and validate Okta configuration from environment variables."""
         logger.debug("Initializing OktaAuthManager")
+        self._auth_lock = asyncio.Lock()
         self.org_url = os.environ.get("OKTA_ORG_URL")
         self.client_id = os.environ.get("OKTA_CLIENT_ID")
         self.scopes = f"{self.scopes} {os.environ.get('OKTA_SCOPES', '').strip()}"
@@ -290,11 +294,14 @@ class OktaAuthManager:
             if token:
                 logger.info("Browserless authentication completed successfully")
             else:
-                # Don't fall back to device flow for security reasons:
-                # - Browserless auth is typically used in server environments where user interaction isn't possible
-                # - Falling back could expose credentials or allow unintended authentication paths
-                # - The choice of auth method should be explicit based on environment configuration
-                sys.exit(1)
+                # No device-flow fallback (security: browserless is for headless
+                # servers; falling back could expose credentials). Auth is now
+                # lazy (first tool call, not startup), so raise instead of
+                # sys.exit — exiting here would kill the server mid-request.
+                raise RuntimeError(
+                    "Browserless Okta authentication failed. Check OKTA_CLIENT_ID, "
+                    "OKTA_KEY_ID, OKTA_PRIVATE_KEY and OKTA_ORG_URL."
+                )
         else:
             logger.info("Starting device flow authentication process")
             device_data = self._initiate_device_authorization()
@@ -327,21 +334,31 @@ class OktaAuthManager:
             logger.debug(f"Token is valid (age: {token_age:.0f}s)")
             return True
 
-        logger.info(f"Token is expired or missing (age: {token_age:.0f}s)")
-        if self.use_browserless_auth:
-            # For browserless auth, we can't refresh, so re-authenticate
-            logger.info("Re-authenticating using browserless flow")
-            await self.authenticate()
-        else:
-            # For device flow, try to refresh first
-            refreshed = self.refresh_access_token()
+        # Lazy auth: concurrent first tool calls can land here at once on a fresh
+        # process. Serialize so only the first authenticates; the rest re-check
+        # under the lock and reuse the token it just minted.
+        async with self._auth_lock:
+            api_token = keyring.get_password(SERVICE_NAME, "api_token")
+            token_age = time.time() - self.token_timestamp
+            if api_token and token_age < expiry_duration:
+                logger.debug(f"Token minted by a concurrent call (age: {token_age:.0f}s)")
+                return True
 
-            # If refresh token is not available or refresh failed, re-authenticate
-            if not refreshed:
-                logger.warning("Token refresh failed, initiating re-authentication")
+            logger.info(f"Token is expired or missing (age: {token_age:.0f}s)")
+            if self.use_browserless_auth:
+                # For browserless auth, we can't refresh, so re-authenticate
+                logger.info("Re-authenticating using browserless flow")
                 await self.authenticate()
+            else:
+                # For device flow, try to refresh first
+                refreshed = self.refresh_access_token()
 
-        return keyring.get_password(SERVICE_NAME, "api_token") is not None
+                # If refresh token is not available or refresh failed, re-authenticate
+                if not refreshed:
+                    logger.warning("Token refresh failed, initiating re-authentication")
+                    await self.authenticate()
+
+            return keyring.get_password(SERVICE_NAME, "api_token") is not None
 
     def clear_tokens(self):
         """Clear all stored tokens from keyring."""

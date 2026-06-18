@@ -15,11 +15,15 @@ from okta_mcp_server.utils.auth.auth_manager import SERVICE_NAME, OktaAuthManage
 async def get_okta_client(manager: OktaAuthManager) -> OktaClient:
     """Initialize and return an Okta client"""
     logger.debug("Initializing Okta client")
-    api_token = keyring.get_password(SERVICE_NAME, "api_token")
+    # Lazy auth: is_valid_token() authenticates on a fresh process and returns
+    # True only once a token exists. A False here means auth genuinely failed —
+    # fail loudly instead of handing the SDK a None bearer token (opaque 401).
     if not await manager.is_valid_token():
-        logger.warning("Token is invalid or expired, re-authenticating")
-        await manager.authenticate()
-        api_token = keyring.get_password(SERVICE_NAME, "api_token")
+        raise RuntimeError(
+            "Okta authentication failed. Verify OKTA_ORG_URL, OKTA_CLIENT_ID and "
+            "credentials, then retry."
+        )
+    api_token = keyring.get_password(SERVICE_NAME, "api_token")
     config = {
         "orgUrl": manager.org_url,
         "token": api_token,
